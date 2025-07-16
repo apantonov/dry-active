@@ -13,4 +13,7 @@ Random numbers were generated using the Mersenne Twister algorithm implemented i
 
 # How to use
 To compile the code, use the provided makefile:
+
 make dryfric
+
+To see available parameters, run ./dryfric --help
