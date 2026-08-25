@@ -1,289 +1,536 @@
-#ifndef __DRY_H__
-#define __DRY_H__
+#ifndef DRY_H
+#define DRY_H
 
 #define _USE_MATH_DEFINES
+
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <vector>
-#include <algorithm>
-#include <limits>
 
 #include "MersenneTwister.h"
-#include "Helper.hpp"
-#include "Vector.hpp"
 
-// If defined, the trajectories are logged into a file
-#define OUTPUT_TRAJECTORIES
+/*
+ * Compile-time switches
+ */
+
+// Log particle trajectories
+//#define OUTPUT_TRAJECTORIES
+
+
+/*
+ * Simulation parameters
+ */
+struct DRYOptions {
+    // Number of particles
+    int N = 20;
+
+    // Diffusion constant
+    double D = 1.0;
+
+    // Total simulation time (excluding equilibration)
+    double tf = 2000.0;
+
+    // Equilibration time
+    double teq = 1000.0;
+
+    // Integration time step
+    double dt = 0.001;
+
+    // Time scale of the activity
+    double tau = 1.0;
+
+    // Activity strength
+    double v0 = 0.01;
+
+    // Dry friction coefficient
+    double delta = 0.0;
+
+    // Time interval between trajectory outputs
+    double tfTrajectory = 1.0;
+
+    // Output filename prefix
+    std::string outputPrefix = "../data/test";
+};
+
+
+class DRY {
+
+public:
+
+    explicit DRY(const DRYOptions& opt)
+        : N(opt.N),
+        D(opt.D),
+        t(0.0),
+        tf(opt.tf),
+        teq(opt.teq),
+        dt(opt.dt),
+        tau(opt.tau),
+        v0(opt.v0),
+        delta(opt.delta),
+        tfTrajectory(opt.tfTrajectory),
+        tTrajectory(0.0),
+        varNoise(0.0),
+        activityNoise(0.0),
+        x(N, 0.0),
+        y(N, 0.0),
+        xinit(N, 0.0),
+        yinit(N, 0.0),
+        vx(N, 0.0),
+        vy(N, 0.0),
+        nx(N, 0.0),
+        ny(N, 0.0),
+        rho(2 * bin * length_bin, 0.0),
+        randy(),
+        filePrefix(opt.outputPrefix),
+        trajectoryFile(nullptr),
+        miscMeasurementFile(nullptr),
+        densityFile(nullptr)
+    {
+    }
+
+
+    ~DRY()
+    {
+        closeOutputFiles();
+    }
+
+
+    /*
+     * Initialize the simulation.
+     */
+    void init()
+    {
+        std::fill(x.begin(), x.end(), 0.0);
+        std::fill(y.begin(), y.end(), 0.0);
+
+        std::fill(vx.begin(), vx.end(), 0.0);
+        std::fill(vy.begin(), vy.end(), 0.0);
+
+        std::fill(nx.begin(), nx.end(), 0.0);
+        std::fill(ny.begin(), ny.end(), 0.0);
+
+        std::fill(rho.begin(), rho.end(), 0.0);
+
+        // Store the initial positions for MSD calculation.
+        xinit = x;
+        yinit = y;
+
+        // Noise amplitudes.
+        varNoise = std::sqrt(2.0 * D * dt);
+        activityNoise = std::sqrt(2.0 * dt / tau);
+
+        t = 0.0;
+        tTrajectory = 0.0;
+    }
+
+
+    /*
+     * Advance the simulation by one time step.
+     */
+    void step()
+    {
+        for (int i = 0; i < N; ++i) {
+
+            /*
+             * Position update.
+             */
+            x[i] += dt * vx[i];
+            y[i] += dt * vy[i];
+
+
+            /*
+             * Current speed.
+             *
+             * Avoid division by zero in the dry-friction term.
+             */
+            const double v2 = vx[i] * vx[i] + vy[i] * vy[i];
+            const double v = std::sqrt(std::max(v2, 1e-16));
+
+
+            /*
+             * Velocity update.
+             *
+             * Dry friction:
+             *
+             *     -delta * v / |v|
+             *
+             * Active force:
+             *
+             *     v0 * n
+             */
+            vx[i] += dt * (
+                -delta * vx[i] / v
+                + v0 * nx[i]
+            );
+
+            vy[i] += dt * (
+                -delta * vy[i] / v
+                + v0 * ny[i]
+            );
+
+
+            /*
+             * Thermal/Langevin noise.
+             */
+            vx[i] += varNoise * randy.randNorm();
+            vy[i] += varNoise * randy.randNorm();
+
+
+            /*
+             * Ornstein-Uhlenbeck activity dynamics.
+             */
+            nx[i] += dt * (-nx[i] / tau)
+                   + activityNoise * randy.randNorm();
+
+            ny[i] += dt * (-ny[i] / tau)
+                   + activityNoise * randy.randNorm();
+
+
+            /*
+             * Velocity histogram.
+             */
+            if (v < length_bin) {
+                const int index =
+                    static_cast<int>(std::round(v * bin));
+
+                if (index >= 0 &&
+                    index < static_cast<int>(rho.size())) {
+                    ++rho[index];
+                }
+            }
+        }
+
+        t += dt;
+    }
+
+
+    /*
+     * Run equilibration without measurements.
+     */
+    void equilibrate(double equilibrationTime)
+    {
+        t = 0.0;
+
+        while (t < equilibrationTime) {
+            step();
+        }
+
+        /*
+         * The equilibrated state becomes the reference
+         * state for the subsequent MSD measurement.
+         */
+        xinit = x;
+        yinit = y;
+
+        /*
+         * Reset simulation time after equilibration.
+         */
+        t = 0.0;
+    }
+
+
+    /*
+     * Open output files.
+     */
+    void openOutputFiles()
+    {
+        closeOutputFiles();
+
+        /*
+         * Miscellaneous measurements.
+         */
+        {
+            const std::string filename =
+                filePrefix + "-misc_measurements.csv";
+
+            miscMeasurementFile =
+                std::fopen(filename.c_str(), "w");
+
+            if (miscMeasurementFile == nullptr) {
+                std::cerr
+                    << "ERROR: Unable to open "
+                    << filename
+                    << '\n';
+
+                std::exit(EXIT_FAILURE);
+            }
+        }
+
+
+        /*
+         * Trajectories.
+         */
+#ifdef OUTPUT_TRAJECTORIES
+
+        {
+            const std::string filename =
+                filePrefix + "-trajectories.csv";
+
+            trajectoryFile =
+                std::fopen(filename.c_str(), "w");
+
+            if (trajectoryFile == nullptr) {
+                std::cerr
+                    << "ERROR: Unable to open "
+                    << filename
+                    << '\n';
+
+                std::exit(EXIT_FAILURE);
+            }
+        }
+
+
+        /*
+         * Velocity-density histogram.
+         */
+        {
+            const std::string filename =
+                filePrefix + "-density.csv";
+
+            densityFile =
+                std::fopen(filename.c_str(), "w");
+
+            if (densityFile == nullptr) {
+                std::cerr
+                    << "ERROR: Unable to open "
+                    << filename
+                    << '\n';
+
+                std::exit(EXIT_FAILURE);
+            }
+        }
+
+#endif
+    }
+
+
+    /*
+     * Close all output files.
+     */
+    void closeOutputFiles()
+    {
+        if (miscMeasurementFile != nullptr) {
+            std::fclose(miscMeasurementFile);
+            miscMeasurementFile = nullptr;
+        }
+
+#ifdef OUTPUT_TRAJECTORIES
+
+        if (trajectoryFile != nullptr) {
+            std::fclose(trajectoryFile);
+            trajectoryFile = nullptr;
+        }
+
+        if (densityFile != nullptr) {
+            std::fclose(densityFile);
+            densityFile = nullptr;
+        }
+
+#endif
+    }
+
+
+    /*
+     * Run the simulation.
+     */
+    void run(double finalTime)
+    {
+        tf = finalTime;
+
+        t = 0.0;
+        tTrajectory = 0.0;
+
+        /*
+         * First MSD measurement after tfTrajectory.
+         * Measurements then become progressively less frequent.
+         */
+        double tMSD = tfTrajectory;
+        double timeSinceMSD = 0.0;
+
+        while (t < tf) {
+
+            step();
+
+            /*
+             * Trajectory output timer.
+             */
+            tTrajectory += dt;
+            timeSinceMSD += dt;
+
+
+#ifdef OUTPUT_TRAJECTORIES
+
+            if (tTrajectory >= tfTrajectory) {
+
+                tTrajectory -= tfTrajectory;
+
+                std::fprintf(
+                    trajectoryFile,
+                    "%f, ",
+                    t
+                );
+
+                for (int i = 0; i < N; ++i) {
+
+                    std::fprintf(
+                        trajectoryFile,
+                        "%f, %f",
+                        x[i],
+                        y[i]
+                    );
+
+                    if (i < N - 1) {
+                        std::fprintf(
+                            trajectoryFile,
+                            ", "
+                        );
+                    }
+                }
+
+                std::fprintf(
+                    trajectoryFile,
+                    "\n"
+                );
+            }
 
 #endif
 
-/* Data structure for transfering simulation parameters from the main program */
-class DRYOptions {
-public:
-	/* Number of realizations */
-	int N;
-	/* Diffusion constant */
-	double D;
-	/* Total time of the simulation run (excluding equilibration time) */
-	double tf;
-	/* Length of the equilibration interval */
-	double teq;
-	/* Time step of the simulation algorithm */
-	double dt;
-	/* Persistence time */
-	double tau;
-	/* Activity */
-	double f0;
-	/* Dry friction */
-	double delta;
-	/* Time interval for output */
-	double tfTrajectory;
 
-	/* This prefix is prepended before the filenames of all output file */
-	std::string outputPrefix;
-	
-	DRYOptions() {
-		/* Set some basic default values */
-		N = 20;
-		D = 1.0;
-		dt = 0.001;
-		tf = 2000;
-		teq = 1000.0;
-		tau = 1.0;
-		f0 = 0.01;
-		tfTrajectory = 1.0;
-		outputPrefix = "../data/test";
-	}
+            /*
+             * MSD measurement.
+             */
+            if (timeSinceMSD >= tMSD) {
+
+                timeSinceMSD = 0.0;
+                tMSD *= 1.1;
+
+                double meanSquaredDisplacement = 0.0;
+
+                for (int i = 0; i < N; ++i) {
+
+                    const double dx =
+                        x[i] - xinit[i];
+
+                    const double dy =
+                        y[i] - yinit[i];
+
+                    meanSquaredDisplacement +=
+                        dx * dx + dy * dy;
+                }
+
+                meanSquaredDisplacement /= N;
+
+                std::fprintf(
+                    miscMeasurementFile,
+                    "%f, %e\n",
+                    t,
+                    meanSquaredDisplacement
+                );
+            }
+        }
+
+
+        /*
+         * Write velocity-density histogram.
+         */
+#ifdef OUTPUT_TRAJECTORIES
+
+        double sum = 0.0;
+
+        for (double value : rho) {
+            sum += value;
+        }
+
+        if (sum > 0.0) {
+
+            for (std::size_t i = 0; i < rho.size(); ++i) {
+
+                const double velocity =
+                    static_cast<double>(i) / bin;
+
+                const double probabilityDensity =
+                    rho[i] * bin / sum;
+
+                std::fprintf(
+                    densityFile,
+                    "%f, %e\n",
+                    velocity,
+                    probabilityDensity
+                );
+            }
+        }
+
+#endif
+    }
+
+private:
+
+    /*
+     * Simulation parameters.
+     */
+    int N;
+
+    double D;
+    double t = 0.0;
+    double tf;
+    double teq;
+    double dt;
+    double tau;
+    double v0;
+    double delta;
+
+    /*
+     * Trajectory output.
+     */
+    double tfTrajectory;
+    double tTrajectory = 0.0;
+
+    /*
+     * Noise amplitudes.
+     */
+    double varNoise = 0.0;
+    double activityNoise = 0.0;
+
+    /*
+     * Particle state.
+     */
+    std::vector<double> x;
+    std::vector<double> y;
+
+    std::vector<double> xinit;
+    std::vector<double> yinit;
+
+    std::vector<double> vx;
+    std::vector<double> vy;
+
+    std::vector<double> nx;
+    std::vector<double> ny;
+
+    /*
+     * Velocity histogram.
+     */
+    static constexpr int bin = 10;
+    static constexpr int length_bin = 20;
+
+    std::vector<double> rho;
+
+    /*
+     * Random-number generator.
+     */
+    MTRand randy;
+
+    /*
+     * Output.
+     */
+    std::string filePrefix;
+
+    FILE* trajectoryFile = nullptr;
+    FILE* miscMeasurementFile = nullptr;
+    FILE* densityFile = nullptr;
 };
 
-class DRY {
-	
-public:
-
-	/* Number of realizations */
-	int N; 
-	/* Diffusionconstant */
-	double D;
-	/* Current simulation time */
-	double t;
-	/* Total time of the simulation run (excluding equilibration time) */
-	double tf;
-	/* Length of the equilibration interval */
-	double teq;
-	/* Time step of the simulation algorithm */
-	double dt;
-	/* Time-scaling */
-	double tau;
-	/* Activity */
-	double f0;
-	/* Dry friction */
-	double delta;
-	/* Time interval for output */
-	double tfTrajectory;
-	/* Variance of the white noise in Langevin equation */
-	double varNoise;
-	/* Variance of the white noise in activity equation */
-	double activityNoise;
-	/* Current positions of the particles */
-	Vector<double> *x;
-	/* Initial positions of the particles */
-	Vector<double> *xinit;
-	/* Current velocites of the particles */
-	Vector<double> *v;
-	/* Current ativities of the particles */
-	Vector<double> *n;
-	/* Probability distribution */
-	Vector<double> *rho;
-	int bin; // Number of bins in the interval [0, 1[
-	int length_bin; // Interval [-l, l] for the probability distribution p(v)
-	/* MersenneTwister Random Number Generator */
-	MTRand randy;
-	/* Output files*/
-	FILE *miscMeasurementFile;
-	#ifdef OUTPUT_TRAJECTORIES
-	FILE *trajectoryFile;
-	FILE *velocityFile;
-	FILE *activityFile;
-	#endif
-	FILE *densityFile;
-	double tTrajectory;
-	std::string filePrefix;
-
-	/* Constructor that initializes memory and sets parameters given by DRYOptions object */
-	DRY(const DRYOptions &opt) {
-		N = opt.N;
-		x = new Vector<double>(N);
-		v = new Vector<double>(N);
-		n = new Vector<double>(N);
-		xinit = new Vector<double>(N);
-		bin = 10;
-		length_bin = 101;
-
-		rho = new Vector<double>(2* bin * length_bin);
-	  
-		dt = opt.dt;
-		D = opt.D;
-		tau = opt.tau;
-		tf = opt.tf;
-		delta = opt.delta;
-		f0 = opt.f0;
-		teq = opt.teq;
-		
-		filePrefix = opt.outputPrefix;
-		tfTrajectory = opt.tfTrajectory;
-
-	}
-	
-	~DRY() {
-	}
-	
-	void init() {
-
-		for (int i = 0; i < N; ++i) {
-			(*x)[i] = 0.0;
-			(*v)[i] = 0.0;
-			(*n)[i] = 0.0;
-		}
-
-		for (int i = 0; i < 2 * bin * length_bin; ++i)
-			(*rho)[i] = 0.0;
-		
-		/* Setup parameters for later use */
-		varNoise = sqrt(2 * D * dt);
-		activityNoise = sqrt(2 * dt / tau);
-		t = 0.0;
-
-	}
-
-	double sign(double a) {
-		if (a > 0) return 1.0;
-		else if (a < 0) return -1.0;
-		else return 0.0;
-	}
-	
-	void step() {
-		int i;
-
-		for (i = 0; i < N; ++i) {
-			(*x)[i] += dt * (*v)[i];
-			(*v)[i] += dt * (-delta * sign((*v)[i])  + (*n)[i] * f0) + varNoise * randy.randNorm();
-			(*n)[i] += dt * (-(*n)[i] / tau) + activityNoise * randy.randNorm();
-			if (fabs((*v)[i]) < length_bin) (*rho)[round(((*v)[i] + length_bin)*bin)] += 1;
-		}
-
-		t += dt;
-
-	}
-
-	/* Do an equilibration run without measurements for the time given by equilibrationTime */
-	void equilibrate(double equilibrationTime) {
-		t = 0.0;
-		while (t < equilibrationTime) {
-			step();
-		}
-		(*x) = (*xinit);
-	}
-	
-	/* Open all necessary files for logging the measured results */
-	void openOutputFiles()  {
-		std::string filename = filePrefix + "-density.csv";
-		densityFile = fopen(filename.c_str(), "w");
-		if (densityFile == NULL) {
-			std::cerr << "ERROR: Unable to open activityFile file " << filename << std::endl;
-			exit(EXIT_FAILURE);
-		}
-		filename = filePrefix + "-misc_measurements.csv";
-		miscMeasurementFile = fopen(filename.c_str(), "w");
-		if (miscMeasurementFile == NULL) {
-			std::cerr << "ERROR: Unable to open miscMeasurementFile file " << filename << std::endl;
-			exit(EXIT_FAILURE);
-		}
-		#ifdef OUTPUT_TRAJECTORIES
-		filename = filePrefix + "-trajectories.csv";
-		trajectoryFile = fopen(filename.c_str(), "w");
-		if (trajectoryFile == NULL) {
-			std::cerr << "ERROR: Unable to open trajectory file " << filename << std::endl;
-			exit(EXIT_FAILURE);
-		}
-		filename = filePrefix + "-velocity.csv";
-		velocityFile = fopen(filename.c_str(), "w");
-		if (velocityFile == NULL) {
-			std::cerr << "ERROR: Unable to open velocityFile file " << filename << std::endl;
-			exit(EXIT_FAILURE);
-		}
-		filename = filePrefix + "-activity.csv";
-		activityFile = fopen(filename.c_str(), "w");
-		if (activityFile == NULL) {
-			std::cerr << "ERROR: Unable to open activityFile file " << filename << std::endl;
-			exit(EXIT_FAILURE);
-		}
-		#endif
-	}
-	
-	/* Close all files */
-	void closeOutputFiles() {
-		fclose(miscMeasurementFile);
-		fclose(densityFile);
-		#ifdef OUTPUT_TRAJECTORIES
-		fclose(trajectoryFile);
-		fclose(velocityFile);
-		fclose(activityFile);
-		#endif
-	}
-
-	/* Run simulation for length of finalTime */
-	void run(double finalTime) {
-		tf = finalTime;
-		t = 0.0;
-		tTrajectory = 0.0;
-		double tMSD = tfTrajectory;
-		double time = 0.0;
-		double MeanSquaredDisplacement;
-		int i;
-		/* Main simulation loop */
-		while (t < tf) {
-			step();
-	  
-			tTrajectory += dt;
-			time += dt;
-			#ifdef OUTPUT_TRAJECTORIES
-			if (tTrajectory >= tfTrajectory) {
-				tTrajectory = 0.0;
-				fprintf(trajectoryFile, "%f, ", t);
-				fprintf(velocityFile, "%f, ", t);
-				fprintf(activityFile, "%f, ", t);
-				for (i = 0; i < N-1; ++i) {
-					fprintf(trajectoryFile, "%f, ", (*x)[i]);
-					fprintf(velocityFile, "%f, ", (*v)[i]);
-					fprintf(activityFile, "%f, ", (*n)[i]);
-				}
-				fprintf(trajectoryFile, "%f\n", (*x)[N-1]);
-				fprintf(velocityFile, "%f\n", (*v)[N-1]);
-				fprintf(activityFile, "%f\n", (*n)[N-1]);
-			}
-			#endif
-
-
-			if (time >= tMSD) {
-				time = 0.0;
-				tMSD *= 1.1;
-				fprintf(miscMeasurementFile, "%e, ", t);
-				MeanSquaredDisplacement = 0.0;
-				for (i = 0; i < N; ++i) MeanSquaredDisplacement += ((*x)[i] - (*xinit)[i]) * ((*x)[i] - (*xinit)[i]);
-				fprintf(miscMeasurementFile, "%e\n", MeanSquaredDisplacement / N);
-			}
-
-		}
-
-		double sum = 0.0;
-		for (i = 0; i < 2 * bin * length_bin; i++)
-			sum += (*rho)[i];
-		for (i = 0; i < 2 * bin * length_bin; i++) {
-			fprintf(densityFile, "%f, ", (i - bin*length_bin) / double(bin));
-			fprintf(densityFile, "%e\n", (*rho)[i] * bin / sum);
-		}
-	}
-
-};
-
+#endif // DRY_H
